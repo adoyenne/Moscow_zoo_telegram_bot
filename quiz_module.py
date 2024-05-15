@@ -2,13 +2,11 @@ import logging
 import random
 import vk_api
 import requests
-from questionnaire import questions
+from questionnaire import questions, animals_descriptions, animals
 import os
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-# Import the CallbackQueryHandler
-from telebot.types import CallbackQuery
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, CallbackQuery
 from error_handler import ErrorHandledClass, error_handler_decorator
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlencode
 from config import vk_app_id, vk_secure_key, vk_service_key
 
 error_handler = ErrorHandledClass()
@@ -52,17 +50,10 @@ class UserData:
     def correct_answers_count(self, value):
         self.data["correct_answers_count"] = value
 
-    @property
-    def quiz_results(self):
-        return self.data.get("quiz_results")
-
-    @quiz_results.setter
-    def quiz_results(self, value):
-        self.data["quiz_results"] = value
 
     @property
     def animals(self):
-        return self.data.get("animals", {"Дельфин": 0, "Обезьяна": 0, "Лев": 0})
+        return self.data.get("animals", animals)
 
     @animals.setter
     def animals(self, value):
@@ -80,11 +71,17 @@ class Quiz:
         self.user_data.load()
 
         # Initialize or reset user data attributes
+        self.user_data.used_questions = set()
         self.user_data.current_question_index = 0
         self.user_data.correct_answers_count = 0
-        self.user_data.quiz_results = None
-        self.user_data.animals = {"Дельфин": 0, "Обезьяна": 0, "Лев": 0}
-        self.totem_animal = None
+        self.user_data.animals = animals
+        self.user_data.totem_animal = None
+        self.user_data.current_question = None
+        self.user_data.question_message = None
+
+        #Вопросы
+        self.questions=questions
+
 
         # Список фраз
         self.phrases = [
@@ -93,14 +90,12 @@ class Quiz:
             "Здорово! Вы молодец!",
             "Узнаём о вас всё больше и больше! Продолжайте!",
             "О, как интересно!",
+            "Ого, не знал!",
+
         ]
 
         # Словарь с описаниями каждого животного
-        self.animals_descriptions = {
-            "Дельфин": "Дельфин - это умное и социальное животное, которое обладает отличными плавательными навыками.",
-            "Обезьяна": "Обезьяны известны своими интеллектуальными способностями и социальной организацией.",
-            "Лев": "Лев - король животного мира, символ силы и мощи. Он является одним из самых крупных хищников в мире.",
-        }
+        self.animals_descriptions = animals_descriptions
 
         # Информация о программе опеки
         self.program_info = (
@@ -119,9 +114,7 @@ class Quiz:
         self.vk_app_id = vk_app_id
         self.vk_secure_key = vk_secure_key
         self.vk_service_key = vk_service_key
-        self.vk_redirect_url = "https://t.me/auth/vk/callback"
-        # Authorization link for VK
-        self.vk_authorization_url = f"https://oauth.vk.com/authorize?client_id={self.vk_app_id}&redirect_uri={self.vk_redirect_url}&scope=wall&response_type=code&display=mobile"
+        self.vk_redirect_url = "https://d474-145-108-246-137.ngrok-free.app/auth/vk/callback"  #d474-145-108-246-137.ngrok-free.app получен с помощью сервиса ngrok!
 
 
     def start_quiz(self):
@@ -129,78 +122,74 @@ class Quiz:
         self.send_question()
 
     def send_question(self):
-        current_question_index = self.user_data.current_question_index
+        if not self.user_data.current_question:
+            unused_questions = list(set(self.questions.keys()) - self.user_data.used_questions)
+            if not unused_questions:
+                self.finish_quiz()
+                return
+            self.user_data.current_question = random.choice(unused_questions)
 
-        if current_question_index < len(questions):
-            question_text = list(questions.keys())[current_question_index]
-            options = questions[question_text]
-            question_message = f"{question_text}\n\n"
-            for option in options:
-                question_message += f"{option}. {options[option]['text']}\n"
-            self.bot.send_message(self.message.chat.id, question_message)
-        else:
-            self.finish_quiz()
+        options = self.questions[self.user_data.current_question]
+        self.user_data.question_message = f"{self.user_data.current_question}\n\n"
+        for option in options:
+            self.user_data.question_message += f"{option}. {options[option]['text']}\n"
+        self.bot.send_message(self.message.chat.id, self.user_data.question_message)
 
     def handle_answer(self, user_answer):
-        current_question_index = self.user_data.current_question_index
-        correct_answers_count = self.user_data.correct_answers_count
-        animals = self.user_data.animals
-
-        options = questions[list(questions.keys())[current_question_index]]
-        if user_answer not in options:
+        question_text = self.user_data.current_question
+        if user_answer not in self.questions[question_text]:
             self.bot.send_message(self.message.chat.id, "К сожалению, вы ввели неправильный вариант. Попробуйте снова.")
-            self.send_question()
+            self.bot.send_message(self.message.chat.id, self.user_data.question_message)
             return
 
-        animal = options[user_answer]['animal']
-        animals[animal] += 1
-        self.user_data.correct_answers_count += 1
-        self.user_data.current_question_index += 1
+        animal = self.questions[question_text][user_answer]['animal']
+        self.user_data.animals[animal] = self.user_data.animals.get(animal, 0) + 1
+        self.user_data.used_questions.add(question_text)
 
         # Выводим случайную фразу
         random_phrase = random.choice(list(self.phrases))
         self.bot.send_message(self.message.chat.id, random_phrase)
 
+        self.user_data.current_question = None
         self.send_question()
 
     def restart_quiz(self, message, user_id=None):
         if message.text.lower() == 'да':
             # Обновляем данные пользователя перед началом новой викторины
+            self.user_data.used_questions = set()
             self.user_data.current_question_index = 0
             self.user_data.correct_answers_count = 0
-            self.user_data.quiz_results = None
-            self.user_data.animals = {"Дельфин": 0, "Обезьяна": 0, "Лев": 0}
+            self.user_data.animals = animals
             self.start_quiz()
         elif message.text.lower() == 'нет':
-            self.bot.send_message(self.message.chat.id, "Спасибо за участие! До новых встреч.")
+            bye_message = "Спасибо за участие! До новых встреч и ждём Вас снова!😊"
+            # Открываем файл с изображением
+            with open('bye.jpg', 'rb') as photo:
+                self.bot.send_photo(self.message.chat.id, photo, caption=bye_message)
         else:
             self.bot.send_message(self.message.chat.id, "Начинаем заново? Введите 'Да' или 'Нет', пожалуйста.")
             self.bot.register_next_step_handler(message, self.restart_quiz)  # Убрали user_id из лямбда-функции
 
     # Изменяем сигнатуру метода finish_quiz, чтобы принимал аргумент code
     def finish_quiz(self):
-        user_first_name = self.message.from_user.first_name  # Получаем имя пользователя
         animals = self.user_data.animals
-        self.totem_animal = max(animals, key=animals.get)
-        message_text = f"Поздравляем! Викторина завершена. Ваше тотемное животное: {self.totem_animal}. "
-        message_to_manager = f"Здравствуйте! Меня зовут {user_first_name} и мне удалось пройти викторину с животными, моё тотемное животное: {self.totem_animal}. "
+        self.user_data.totem_animal = max(animals, key=animals.get)
+        message_text = f"Поздравляем! Викторина завершена. Ваше тотемное животное: {self.user_data.totem_animal}. "
         # Добавляем описание выбранного животного, если оно доступно
-        if self.totem_animal in self.animals_descriptions:
-            message_text += f"{self.animals_descriptions[self.totem_animal]}"
+        if self.user_data.totem_animal in self.animals_descriptions:
+            message_text += f"{self.animals_descriptions[self.user_data.totem_animal]}"
 
         # Проверяем наличие фотографии выбранного животного
-        photo_path = os.path.join(self.animals_folder, f"{self.totem_animal}.jpg")
+        photo_path = os.path.join(self.animals_folder, f"{self.user_data.totem_animal}.jpg")
         if os.path.exists(photo_path):
             with open(photo_path, "rb") as photo:
                 self.photo = self.bot.send_photo(self.message.chat.id, photo, caption=message_text)
 
         else:
             self.bot.send_message(self.message.chat.id,
-                                  message_text + "К сожалению, фотография этого животного сейчас не доступна.")
-        quiz_results = message_to_manager
+                                  message_text + "К сожалению, фотография этого животного сейчас не доступна😔")
 
-        # Сохраняем результаты викторины в пользовательских данных
-        self.user_data.quiz_results = quiz_results
+
         self.user_data.save()  # Сохраняем их обратно в файл
 
         # Добавляем информацию о программе опеки и кнопку-ссылку для авторизации в VK
@@ -216,8 +205,18 @@ class Quiz:
 
         self.bot.send_message(self.message.chat.id, self.program_info, reply_markup=keyboard)
 
-        #self.bot.send_message(self.message.chat.id, "Хотите попробовать викторину снова? (Да/Нет)")
-        #self.bot.register_next_step_handler(self.message, self.restart_quiz)
+
+
+    def get_authorization_url(self, client_id, redirect_uri):
+        params = {
+                "client_id": self.vk_app_id,
+                "redirect_uri": self.vk_redirect_url,
+                "scope": "wall",
+                "response_type": "code",
+                "display": "page"
+        }
+        url = f"https://oauth.vk.com/authorize?{urlencode(params)}"
+        return url
 
 
     def handle_callback_query(self, call: CallbackQuery):
@@ -230,46 +229,27 @@ class Quiz:
             self.bot.register_next_step_handler(call.message, self.process_feedback)
 
         if call.data == 'forward_results':  # Если нажата кнопка "Связаться с сотрудником зоопарка"
-            user_first_name = call.from_user.first_name  # Имя пользователя
-            # Сообщение для отправки менеджеру
-            user_name = self.message.from_user.username
-            message_to_manager = (f"Здравствуйте! Меня зовут @{user_name} и мне удалось пройти викторину с животными, моё тотемное животное: {self.totem_animal}. ")
 
-            # Никнейм сотрудника зоопарка:
-            zoo_employee_username = "1382756222" #в качестве сотрудника, поставил код чата в боте, за которым приглядывает администратор...
+            # Отправляем пользователю запрос на написание сообщения
+            self.bot.send_message(call.message.chat.id, "Пожалуйста, напишите ваше сообщение для сотрудника зоопарка:")
 
-            # Отправка сообщения от пользователя к менеджеру
-            self.bot.send_message(zoo_employee_username, message_to_manager)
+            # Ожидаем следующее сообщение от пользователя, чтобы передать его сотруднику зоопарка
+            self.bot.register_next_step_handler(call.message, self.send_message_to_zoo_employee)
 
-            # Отправка пользователю уведомления о том, что сообщение было отправлено
-            self.bot.send_message(call.message.chat.id, "Ваше сообщение было успешно отправлено сотруднику зоопарка.")
 
 
         elif call.data == 'social_network_support':
-            # Construct the authorization URL
-            authorization_url = self.vk_authorization_url
+            # Здесь используем метод для создания промежуточного URL
+            auth_url = self.get_authorization_url(self.vk_app_id, self.vk_redirect_url)
+            # Создаем InlineKeyboardButton с промежуточным URL
             keyboard = InlineKeyboardMarkup()
-            keyboard.add(InlineKeyboardButton("VK", url=authorization_url))
-            self.bot.send_message(call.message.chat.id, "Нажмите сюда, для авторизации через VK:", reply_markup=keyboard)
+            keyboard.add(InlineKeyboardButton("VK", url=auth_url))
 
-        #Здксь нужно как-то получить redirect_url, то есть ссылку после авторизации через VK,
-        # с кодом, нужным для передачи в handle_vk_authorization
-        #ссылка вида: https://t.me/auth/vk/callback?code=38gh904ghghfj9fjrf04
+            # Отправляем сообщение с кнопкой в бот
+            self.bot.send_message(call.message.chat.id, "Нажмите сюда, для авторизации через VK:",
+                                  reply_markup=keyboard)
 
 
-    def handle_vk_auth_redirect(self, redirect_url):
-        # Обрабатываем перенаправление пользователя с кодом авторизации VK
-        # В этом методе мы можем извлечь код из URL-адреса и использовать его для авторизации VK
-        # Здесь предполагается, что URL-адрес будет иметь аргумент 'code' в запросе
-        parsed_url = urlparse(redirect_url)
-        query_params = parse_qs(parsed_url.query)
-        authorization_code = query_params.get('code')[0] if 'code' in query_params else None
-
-        if authorization_code:
-            # Если удалось извлечь код авторизации, используем его для авторизации VK
-            self.handle_vk_authorization(authorization_code)
-        else:
-            logger.error("Failed to extract authorization code from VK redirect URL.")
 
     def handle_vk_authorization(self, code):
         try:
@@ -284,7 +264,6 @@ class Quiz:
             self.bot.send_message(self.message.chat.id, "Failed to authorize with VK. Please try again later.")
 
     def exchange_code_for_access_token(self, code):
-        print("Exchanging authorization code for access token...")
         token_url = "https://oauth.vk.com/access_token"
         params = {
             "client_id": self.vk_app_id,
@@ -293,12 +272,10 @@ class Quiz:
             "code": code
         }
         response = requests.get(token_url, params=params)
-        print("Response received from VK:", response.text)
         if response.status_code == 200:
             data = response.json()
             access_token = data.get("access_token")
             if access_token:
-                print("Access token received successfully.")
                 return access_token
             else:
                 raise ValueError("Access token not found in the response.")
@@ -311,7 +288,7 @@ class Quiz:
             vk_session = vk_api.VkApi(token=access_token)
             vk = vk_session.get_api()
 
-            message = f"Я прошел викторину и мое тотемное животное: {self.totem_animal}. Попробуйте викторину сами в {self.bot_username}."
+            message = f"Я прошел викторину и мое тотемное животное: {self.user_data.totem_animal}. Попробуйте викторину сами в {self.bot_username}."
             print("Message to be posted on VK:", message)
             vk.wall.post(owner_id=self.user_id, message=message)
 
@@ -328,6 +305,27 @@ class Quiz:
         with open("feedback_from_users_zoo_bot.txt", "a") as file:
             file.write(f"User ID: {user_id}, Feedback: {feedback}\n")
         self.bot.send_message(user_id, "Спасибо за ваш отзыв!")
+
+    def send_message_to_zoo_employee(self,message):
+        # Получаем текст сообщения от пользователя
+        user_message = message.text
+
+        # Получаем имя пользователя
+        user_name = message.from_user.username
+
+        # Формируем сообщение для отправки менеджеру, добавляя имя пользователя
+        message_to_manager = (
+            f"Здравствуйте! Меня зовут @{user_name}. Я прошёл викторину и моё тотемное животное - {self.user_data.totem_animal}. Я хочу передать следующее сообщение: {user_message}")
+
+        # Никнейм сотрудника зоопарка:
+        zoo_employee_username = "1382756222"  # замените на фактический никнейм сотрудника зоопарка
+
+        # Отправка сообщения от пользователя к менеджеру
+        self.bot.send_message(zoo_employee_username, message_to_manager)
+
+
+        # Отправка пользователю уведомления о том, что сообщение было отправлено
+        self.bot.send_message(message.chat.id, f"Ваше сообщение было успешно отправлено сотруднику зоопарка 😇. Текст сообщения: {message_to_manager}")
 
 
 
